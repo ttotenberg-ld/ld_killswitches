@@ -1,17 +1,30 @@
-# Python virtual environment
-venv/
+# Environment variables
+.env
+
+# CSV outputs
+*.csv
 
 # Python cache files
 __pycache__/
 *.py[cod]
 
+# Virtual environment
+venv/
+env/
+
 # IDE-specific files
 .vscode/
 .idea/
 
-# Logs
-*.log
-
 # Operating system files
 .DS_Store
 Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+
+# JSON files (including audit_log.json)
+*.json
