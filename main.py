@@ -11,7 +11,7 @@ import re
 
 # Configuration constants
 PROJECT = "*"  # The project to search for audit log entries. Use "*" to search all projects
-SEARCH_DATE = 1729451496000  # Cutoff date for audit log entries, in epoch milliseconds
+SEARCH_DATE = 1729451496000  # Cutoff date for audit log entries, in epoch milliseconds. You can find a converter here: https://www.epochconverter.com/
 
 # Set up logging for better debugging and monitoring
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

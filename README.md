@@ -13,10 +13,10 @@ This script extracts and consolidates audit log entries from LaunchDarkly, focus
 
 2. Install the required packages:
    ```
-   pip install -r requirements.txt
+   pip3 install -r requirements.txt
    ```
 
-3. Create a `.env` file in the project root and add your LaunchDarkly API key:
+3. Change the `.env` file in the project root and add your LaunchDarkly API key:
    ```
    LAUNCHDARKLY_API_KEY=your_api_key_here
    ```
