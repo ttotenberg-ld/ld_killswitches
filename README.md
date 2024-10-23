@@ -29,7 +29,7 @@ This script extracts and consolidates audit log entries from LaunchDarkly, focus
 
 2. Run the script:
    ```
-   python main.py
+   python3 main.py
    ```
 
 3. The script will output progress information and save the results to `consolidated_results.csv`.
