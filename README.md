@@ -7,8 +7,8 @@ This script extracts and consolidates audit log entries from LaunchDarkly, focus
 
 1. Clone this repository:
    ```
-   git clone https://github.com/your-username/launchdarkly-audit-log-extractor.git
-   cd launchdarkly-audit-log-extractor
+   git clone https://github.com/ttotenberg-ld/ld_killswitches.git
+   cd ld_killswitches
    ```
 
 2. Install the required packages:
