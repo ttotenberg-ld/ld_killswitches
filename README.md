@@ -23,9 +23,9 @@ This script extracts and consolidates audit log entries from LaunchDarkly, focus
 
 ## Usage
 
-1. Adjust the `PROJECT` and `SEARCH_DATE` constants in `main.py` if needed:
+1. Adjust the `PROJECT` and `SEARCH_DATE` in `main.py` if needed:
    - `PROJECT`: The project to search for audit log entries. Use "*" to search all projects.
-   - `SEARCH_DATE`: The cutoff date for audit log entries, in epoch milliseconds.
+   - `SEARCH_DATE`: The cutoff date for audit log entries, in epoch milliseconds. The script will search for flags turned off after this date.
 
 2. Run the script:
    ```
