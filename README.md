@@ -45,3 +45,4 @@ The script generates a CSV file named `consolidated_results.csv` with the follow
 - last_name: Last name of the member who turned off the flag
 - email: Email of the member who turned off the flag
 - project_key: The key of the project the flag belongs to
+- comment: Any comment associated with turning off the flag

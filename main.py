@@ -109,8 +109,8 @@ def process_batch(batch, csv_writer):
             # Extract project key
             project_key = extract_project_key(site_href)
             
-            # Log the extracted project key for debugging
-            logging.debug(f"Extracted project key '{project_key}' from site_href: {site_href}")
+            # Extract comment
+            comment = entry.get('comment', '')
             
             # Convert timestamp to human-readable format
             if date:
@@ -122,7 +122,8 @@ def process_batch(batch, csv_writer):
                 'first_name': first_name,
                 'last_name': last_name,
                 'email': email,
-                'project_key': project_key
+                'project_key': project_key,
+                'comment': comment
             })
 
     # Consolidate results, removing duplicates
@@ -135,7 +136,7 @@ def process_batch(batch, csv_writer):
             consolidated_results.add((
                 name, site_href, entry['date'],
                 entry['first_name'], entry['last_name'], entry['email'],
-                entry['project_key']
+                entry['project_key'], entry['comment']
             ))
 
     # Convert set to list of dictionaries for easier handling
@@ -147,9 +148,10 @@ def process_batch(batch, csv_writer):
             'first_name': first_name,
             'last_name': last_name,
             'email': email,
-            'project_key': project_key
+            'project_key': project_key,
+            'comment': comment
         }
-        for name, site_href, date, first_name, last_name, email, project_key in consolidated_results
+        for name, site_href, date, first_name, last_name, email, project_key, comment in consolidated_results
     ]
 
     # Sort the results by date (most recent first) and then by name
@@ -163,7 +165,7 @@ def process_batch(batch, csv_writer):
 
 # Clear the CSV file and write the header
 with open('consolidated_results.csv', 'w', newline='') as csv_file:
-    fieldnames = ['name', 'site_href', 'date', 'first_name', 'last_name', 'email', 'project_key']
+    fieldnames = ['name', 'site_href', 'date', 'first_name', 'last_name', 'email', 'project_key', 'comment']
     csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
     csv_writer.writeheader()
 
@@ -174,7 +176,7 @@ batch = []
 
 # Fetch audit log entries until reaching a specific date or end of data
 with open('consolidated_results.csv', 'a', newline='') as csv_file:
-    fieldnames = ['name', 'site_href', 'date', 'first_name', 'last_name', 'email', 'project_key']
+    fieldnames = ['name', 'site_href', 'date', 'first_name', 'last_name', 'email', 'project_key', 'comment']
     csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
 
     while date > SEARCH_DATE:
