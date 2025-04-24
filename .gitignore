@@ -27,3 +27,5 @@ Thumbs.db
 
 # JSON files (including audit_log.json)
 *.json
+
+sample.py
