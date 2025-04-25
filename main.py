@@ -639,7 +639,7 @@ def write_results_to_csv(filename, fieldnames, results):
     """Writes the collected results to the specified CSV file."""
     try:
         # Use 'a' append mode as the header is written during initialization
-        with open(filename, 'a', newline='') as csv_file: 
+        with open(filename, 'a', newline='', encoding='utf-8') as csv_file: 
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writerows(results)
         logging.info(f"Successfully wrote {len(results)} records to {filename}")
