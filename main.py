@@ -5,7 +5,7 @@ import logging
 from dotenv import load_dotenv
 import csv
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque # Added deque for efficient state management if needed later
 import time
 import re
 import copy # Needed for deep copying headers for safe logging
@@ -13,6 +13,36 @@ import copy # Needed for deep copying headers for safe logging
 # Configuration constants
 PROJECT = "*"  # The project to search for audit log entries. Use "*" to search all projects
 SEARCH_DATE = 1743551530000  # Earliest date to search for audit log entries, in epoch milliseconds. You can find a converter here: https://www.epochconverter.com/
+
+# --- NEW: Define rollout actions and description substrings (updated) ---
+# Start Actions
+ACTION_START_ROLLOUT_FALLTHROUGH = "updateFallthroughWithMeasuredRollout"
+ACTION_START_ROLLOUT_RULE = "updateRulesWithMeasuredRollout"
+# Use substrings now, not prefixes
+SUBSTR_START_ROLLOUT_FALLTHROUGH = "Set a guarded rollout on the default rule"
+# For rules, check for either of these substrings based on samples
+SUBSTR_START_ROLLOUT_RULE_1 = "Updated a rule with a guarded rollout"
+SUBSTR_START_ROLLOUT_RULE_2 = "Started guarded rollout on rule"
+
+# Automatic Stop Actions
+ACTION_AUTO_STOP_FALLTHROUGH = "updateFallthrough"
+ACTION_AUTO_STOP_RULE = "updateRules"
+SUBSTR_AUTO_STOP_FALLTHROUGH = "Reverted the guarded rollout on the default rule"
+SUBSTR_AUTO_STOP_RULE = "Reverted the guarded rollout for the rule"
+
+# Manual Stop Actions
+ACTION_MANUAL_STOP_FALLTHROUGH = "stopMeasuredRolloutOnFlagFallthrough"
+ACTION_MANUAL_STOP_RULE = "stopMeasuredRolloutOnFlagRule"
+SUBSTR_MANUAL_STOP_FALLTHROUGH = "Guarded rollout on the default rule was manually reverted"
+# No reliable description substring for manual rule stop based on samples - rely on action only
+# DESC_PREFIX_MANUAL_STOP_RULE = # REMOVED
+# --- END NEW DEFINITIONS ---
+
+# --- NEW: Define output filenames ---
+OUTPUT_FLAG_DURATION_CSV = 'flag_on_durations.csv'
+OUTPUT_ROLLOUT_AUTO_CSV = 'measured_rollout_automatic_rollback.csv'
+OUTPUT_ROLLOUT_MANUAL_CSV = 'measured_rollout_manual_rollback.csv'
+# --- END NEW FILENAMES ---
 
 # Set up logging for better debugging and monitoring
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -36,26 +66,36 @@ logging.info("API key retrieved from environment variables")
 # Set up headers for API requests
 headers = {
   'Authorization': f'{api_key}',
-  'Content-Type': 'application/json'
+  'Content-Type': 'application/json' # Needed again for POST
 }
 
-# Initial payload for finding "turned off" events
+# --- Define ALL_RELEVANT_ACTIONS first ---
+ALL_RELEVANT_ACTIONS = [
+    "updateOn", # For flag on/off
+    ACTION_START_ROLLOUT_FALLTHROUGH,
+    ACTION_START_ROLLOUT_RULE,
+    ACTION_AUTO_STOP_FALLTHROUGH,
+    ACTION_AUTO_STOP_RULE,
+    ACTION_MANUAL_STOP_FALLTHROUGH,
+    ACTION_MANUAL_STOP_RULE
+]
+
+# --- REINSTATED: initial_payload for POST ---
 initial_payload = json.dumps([
   {
     "resources": [
-      f"proj/{PROJECT}:env/production:flag/*"
+      f"proj/{PROJECT}:env/production:flag/*" # Focus on production flags
     ],
     "effect": "allow",
-    "actions": [
-      "updateOn"  # This action covers both turning on and off
-    ]
+    "actions": ALL_RELEVANT_ACTIONS # Fetch all action types we might need
   }
 ])
+# --- END REINSTATED PAYLOAD ---
 
 # API and processing configuration
-limit = 20  # Number of items per page in API response for the initial scan
-batch_size = 50 # Number of "turned off" items to collect before processing and writing
+limit = 20  # Number of items per page
 
+# --- Define Helper Functions Before Processing Loop ---
 def extract_project_key(site_href):
     """
     Extract the project key from the site href, trying various known patterns.
@@ -142,301 +182,516 @@ def extract_flag_key_from_site_href(site_href):
         logging.debug(f"Could not extract flag key from site_href format (expected '/features/...'): {site_href}")
         return ''
 
-def get_turn_on_details(flag_key, project_key, turn_off_timestamp_ms):
-    """
-    Find the single most recent 'turned on' event for a specific flag before a given timestamp.
-    Relies on the API returning the correct event with limit=1 based on payload filter.
-    
-    Args:
-    flag_key (str): The key of the flag.
-    project_key (str): The key of the project.
-    turn_off_timestamp_ms (int): The timestamp (in ms) when the flag was turned off.
-
-    Returns:
-    int: The timestamp (in ms) when the flag was turned on, or None if not found.
-    """
-    logging.debug(f"Searching for SINGLE most recent 'turn on' event for flag '{flag_key}' before {turn_off_timestamp_ms}")
-    
-    if not flag_key or not project_key:
-        logging.warning(f"Missing flag_key ('{flag_key}') or project_key ('{project_key}') for 'turn on' search. Skipping.")
-        return None
-
-    target_url = base_url + api_url_auditlog
-
-    try:
-        resource_string = f"proj/{project_key}:env/production:flag/{flag_key}"
-        payload = json.dumps([
-            {
-                "resources": [resource_string],
-                "effect": "allow",
-                "actions": ["updateOn"]
-            }
-        ])
-    except Exception as e:
-        logging.error(f"Error constructing payload for flag '{flag_key}', project '{project_key}': {e}")
-        return None
-    
-    params = {
-        'limit': 1,
-        'before': turn_off_timestamp_ms
+def get_event_details(entry):
+    """Extracts common and relevant details from an audit log entry."""
+    details = {
+        'timestamp': entry.get('date'),
+        'flag_name': entry.get('name', ''),
+        'description': entry.get('description', ''),
+        'comment': entry.get('comment', ''),
+        'action': None,
+        'member_email': entry.get('member', {}).get('email'), # May be None for API actions
+        'project_key': 'unknown',
+        'flag_key': 'unknown',
+        'site_href_raw': entry.get('_links', {}).get('site', {}).get('href', ''),
+        'parent_href': entry.get('_links', {}).get('parent', {}).get('href', ''),
+        'titleVerb': entry.get('titleVerb', '') # Added titleVerb
     }
 
-    # --- Detailed Request Logging --- 
-    # Mask API key for safety
-    logged_headers = copy.deepcopy(headers)
-    if 'Authorization' in logged_headers:
-        logged_headers['Authorization'] = 'api-key-masked' 
-    logging.debug(f"--- Turn On Details Request --- F:{flag_key}")
-    logging.debug(f"URL: {target_url}")
-    logging.debug(f"PARAMS: {params}")
-    logging.debug(f"HEADERS: {logged_headers}")
-    logging.debug(f"PAYLOAD: {payload}")
-    # --- End Detailed Request Logging ---
+    # Extract action from the accesses array
+    accesses = entry.get('accesses', [])
+    if accesses and isinstance(accesses, list) and len(accesses) > 0:
+        details['action'] = accesses[0].get('action')
 
-    try:
-        response = requests.post(target_url, headers=headers, params=params, data=payload)
+    # Extract flag key (reusing existing logic - usually works on parent_href or site_href)
+    flag_key = extract_flag_key_from_href(details['parent_href'])
+    if not flag_key:
+        flag_key = extract_flag_key_from_site_href(details['site_href_raw'])
+    if flag_key:
+        details['flag_key'] = flag_key
+    else:
+        logging.debug(f"Could not determine flag key for entry at {details['timestamp']}")
+
+    # --- MODIFIED: Project Key Extraction Logic --- 
+    project_key = ''
+    parent_href = details['parent_href']
+    site_href_raw = details['site_href_raw']
+    
+    # Only attempt project key extraction from parent_href if it seems relevant
+    if parent_href and ('/flags/' in parent_href or '/projects/' in parent_href):
+        logging.debug(f"Attempting project key extraction from relevant parent_href: {parent_href}")
+        project_key = extract_project_key(parent_href)
+        if project_key:
+            logging.debug(f"Successfully extracted project key '{project_key}' from parent_href.")
+        else:
+            logging.debug(f"Failed to extract project key from relevant parent_href, will try site_href.")
+    else:
+         logging.debug(f"Skipping project key extraction from non-specific parent_href: {parent_href}")
+
+    # If project_key wasn't found via parent_href, try site_href_raw
+    if not project_key:
+        logging.debug(f"Attempting project key extraction from site_href_raw: {site_href_raw}")
+        project_key = extract_project_key(site_href_raw)
+        if project_key:
+             logging.debug(f"Successfully extracted project key '{project_key}' from site_href_raw.")
+        else:
+            # Final failure point for project key
+            logging.debug(f"Could not determine project key from site_href_raw either for entry at {details['timestamp']}")
+            # Keep project_key as '' which will become 'unknown'
+            
+    details['project_key'] = project_key if project_key else 'unknown'
+    # --- END MODIFIED Project Key Extraction --- 
+
+    # Construct a more useful site href if possible
+    if details['project_key'] != 'unknown' and details['flag_key'] != 'unknown':
+        details['site_href'] = f"https://app.launchdarkly.com/projects/{details['project_key']}/flags/{details['flag_key']}/targeting/production"
+    else:
+        details['site_href'] = details['site_href_raw']
+
+    # Basic validation
+    if not details['timestamp']:
+        logging.warning(f"Audit entry missing timestamp: {entry}")
+        return None
         
-        # --- Detailed Response Logging --- 
-        logging.debug(f"--- Turn On Details Response --- F:{flag_key}")
-        logging.debug(f"STATUS CODE: {response.status_code}")
-        # Limit response text logging length in case it's huge
-        response_text_snippet = response.text[:1000] + ('...' if len(response.text) > 1000 else '')
-        logging.debug(f"RESPONSE TEXT: {response_text_snippet}")
-        # --- End Detailed Response Logging ---
+    return details
 
-        if response.status_code == 400:
-            # Error already logged above, just return None
-            # Log full text again here specifically for 400 error context if needed
-            # logging.error(f"400 Bad Request full response text: {response.text}") 
-            return None 
-        else:
-            response.raise_for_status()
+def check_description_contains(description, substring):
+    """Checks if the description contains the given substring, ignoring case and leading/trailing whitespace."""
+    if not description or not substring:
+        return False
+    # Normalize both to lower case for robust matching
+    return substring.lower() in description.lower()
 
-        data = response.json()
-        items = data.get('items', [])
+def classify_event(details):
+    """Classifies the event based on action and description content."""
+    action = details['action'] # Action might be None if accesses array is missing/empty
+    desc = details['description']
 
-        if items:
-            first_item = items[0]
-            if first_item.get('titleVerb') == 'turned on the flag':
-                turn_on_timestamp_ms_found = first_item.get('date')
-                if turn_on_timestamp_ms_found:
-                     logging.debug(f"Found 'turn on' event for '{flag_key}' at {turn_on_timestamp_ms_found}")
-                     return turn_on_timestamp_ms_found
-                else:
-                    logging.warning(f"'Turned on' event found for '{flag_key}', but it lacked a date.")
-                    return None 
-            else:
-                found_verb = first_item.get('titleVerb', 'N/A')
-                found_date = first_item.get('date', 'N/A')
-                logging.info(f"Most recent event matching payload for '{flag_key}' before {turn_off_timestamp_ms} was not 'turned on'. Found verb: '{found_verb}' at date: {found_date}.")
-                return None
-        else:
-            logging.info(f"No event found matching payload criteria for '{flag_key}' before {turn_off_timestamp_ms}.")
-            return None
+    # Flag On/Off (using titleVerb is primary identifier)
+    if details.get('titleVerb') == 'turned on the flag':
+        return 'flag_on'
+    if details.get('titleVerb') == 'turned off the flag':
+        return 'flag_off'
+        
+    # If action is missing, cannot classify further
+    if not action: 
+        return 'other'
 
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching 'turn on' details for flag '{flag_key}': {e}")
-        return None
-    except json.JSONDecodeError as e:
-        # Log the problematic text that couldn't be decoded
-        logging.error(f"Error decoding JSON response for flag '{flag_key}': {e}. Response text snippet: {response_text_snippet}")
-        return None
+    # Rollout Start
+    if action == ACTION_START_ROLLOUT_FALLTHROUGH and check_description_contains(desc, SUBSTR_START_ROLLOUT_FALLTHROUGH):
+        return 'rollout_start_fallthrough'
+    # Check for either rule start substring
+    if action == ACTION_START_ROLLOUT_RULE and (check_description_contains(desc, SUBSTR_START_ROLLOUT_RULE_1) or check_description_contains(desc, SUBSTR_START_ROLLOUT_RULE_2)):
+        return 'rollout_start_rule'
 
+    # Automatic Rollback
+    if action == ACTION_AUTO_STOP_FALLTHROUGH and check_description_contains(desc, SUBSTR_AUTO_STOP_FALLTHROUGH):
+        return 'rollout_stop_auto_fallthrough'
+    if action == ACTION_AUTO_STOP_RULE and check_description_contains(desc, SUBSTR_AUTO_STOP_RULE):
+        return 'rollout_stop_auto_rule'
 
-def process_batch(batch, csv_writer):
-    """
-    Process a batch of audit log entries, find corresponding 'turn on' events,
-    calculate durations, and write to CSV.
+    # Manual Rollback
+    if action == ACTION_MANUAL_STOP_FALLTHROUGH and check_description_contains(desc, SUBSTR_MANUAL_STOP_FALLTHROUGH):
+        return 'rollout_stop_manual_fallthrough'
+    # For manual rule stop, rely only on the action as description is unreliable
+    if action == ACTION_MANUAL_STOP_RULE:
+        return 'rollout_stop_manual_rule'
 
-    Args:
-    batch (list): List of audit log entries to process (expecting 'turned off' events)
-    csv_writer (csv.DictWriter): CSV writer object to write results
+    return 'other' # Not an event we are tracking
+# --- End Helper Function Definitions ---
 
-    Returns:
-    int: Number of 'turned off' entries processed and written to CSV
-    """
-    processed_count = 0
-    for entry in batch:
-        if entry.get('titleVerb') == 'turned off the flag':
-            flag_name = entry.get('name', '')
-            links = entry.get('_links', {})
-            parent_href = links.get('parent', {}).get('href', '')
-            site_href_raw = links.get('site', {}).get('href', '')
-            
-            # --- Flag Key Extraction (Existing Logic - Seems OK) ---
-            flag_key = extract_flag_key_from_href(parent_href)
-            if not flag_key:
-                logging.debug(f"Flag key not found in parent_href ('{parent_href}'), trying site_href ('{site_href_raw}') for flag '{flag_name}'")
-                flag_key = extract_flag_key_from_site_href(site_href_raw)
-            if not flag_key:
-                logging.warning(f"Could not determine flag key for entry with name '{flag_name}' from parent_href ('{parent_href}') or site_href ('{site_href_raw}'). Skipping.")
-                continue
-            
-            # --- Project Key Extraction (Revised Logic) ---
-            project_key = ''
-            # Try parent_href ONLY if it looks like it contains the flag key structure
-            if parent_href and '/flags/' in parent_href: 
-                logging.debug(f"Attempting project key extraction from parent_href: {parent_href}")
-                project_key = extract_project_key(parent_href)
-                if project_key:
-                    logging.debug(f"Successfully extracted project key '{project_key}' from parent_href.")
-                else:
-                    logging.debug(f"Failed to extract project key from parent_href ('{parent_href}'), will try site_href.")
-            else:
-                 logging.debug(f"Parent_href ('{parent_href}') does not contain '/flags/', skipping direct project key extraction from it.")
-
-            # If project_key wasn't found via parent_href, try site_href_raw
-            if not project_key:
-                logging.debug(f"Attempting project key extraction from site_href_raw: {site_href_raw}")
-                project_key = extract_project_key(site_href_raw) 
-                if project_key:
-                     logging.debug(f"Successfully extracted project key '{project_key}' from site_href_raw.")
-                else:
-                    # This is the final failure point for project key
-                    logging.warning(f"Could not determine project key for entry with name '{flag_name}' from parent_href ('{parent_href}') or site_href ('{site_href_raw}'). Using fallback 'unknown'.")
-                    project_key = 'unknown' # Assign a placeholder if absolutely needed, or handle differently
-
-            # --- End Project Key Extraction --- 
-                
-            turn_off_timestamp_ms = entry.get('date')
-            turn_off_date_str = datetime.fromtimestamp(turn_off_timestamp_ms / 1000).strftime('%Y-%m-%d %H:%M:%S') if turn_off_timestamp_ms else ''
-
-            member = entry.get('member', {})
-            first_name = member.get('firstName', '')
-            last_name = member.get('lastName', '')
-            email = member.get('email', '')
-            comment = entry.get('comment', '')
-            
-            site_href = f"https://app.launchdarkly.com/projects/{project_key}/flags/{flag_key}/targeting/production" if project_key != 'unknown' and flag_key else site_href_raw
-
-            turn_on_timestamp_ms = None
-            turn_on_date_str = 'N/A'
-            duration_seconds = 'N/A'
-
-            if flag_key and project_key != 'unknown' and turn_off_timestamp_ms:
-                 turn_on_timestamp_ms = get_turn_on_details(flag_key, project_key, turn_off_timestamp_ms)
-                 if turn_on_timestamp_ms:
-                     turn_on_date_str = datetime.fromtimestamp(turn_on_timestamp_ms / 1000).strftime('%Y-%m-%d %H:%M:%S')
-                     duration_seconds = (turn_off_timestamp_ms - turn_on_timestamp_ms) / 1000
-                     logging.info(f"Flag '{flag_name}' (key: '{flag_key}'): Off at {turn_off_date_str}, On at {turn_on_date_str}, Duration: {duration_seconds:.2f}s")
-                 else:
-                     logging.info(f"Could not find 'turn on' details for flag '{flag_name}' (key: '{flag_key}')")
-            
-            result = {
-                'flag_key': flag_key,
-                'flag_name': flag_name,
-                'site_href': site_href,
-                'turn_off_date': turn_off_date_str,
-                'turn_on_date': turn_on_date_str,
-                'duration_seconds': f"{duration_seconds:.2f}" if isinstance(duration_seconds, (int, float)) else duration_seconds,
-                'turned_off_by_first_name': first_name,
-                'turned_off_by_last_name': last_name,
-                'turned_off_by_email': email,
-                'project_key': project_key,
-                'comment': comment
-            }
-            csv_writer.writerow(result)
-            processed_count += 1
-
-    return processed_count
-
-# Define CSV fieldnames including new fields
-fieldnames = [
+# --- Define NEW CSV fieldnames for the three files ---
+fieldnames_flag_duration = [
     'flag_key', 'flag_name', 'site_href', 'turn_off_date', 'turn_on_date', 'duration_seconds',
     'turned_off_by_first_name', 'turned_off_by_last_name', 'turned_off_by_email',
     'project_key', 'comment'
 ]
 
-# Clear the CSV file and write the header
-output_filename = 'flag_off_durations.csv'
-try:
-    with open(output_filename, 'w', newline='') as csv_file:
-        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        csv_writer.writeheader()
-    logging.info(f"Initialized CSV file: {output_filename}")
-except IOError as e:
-    logging.error(f"Error opening or writing header to CSV file {output_filename}: {e}")
-    exit(1)
+fieldnames_rollout = [
+    'flag_key', 'flag_name', 'site_href', 'rollout_type', # 'fallthrough' or 'rule'
+    'rollback_type', # 'automatic' or 'manual'
+    'start_date', 'end_date', 'duration_seconds',
+    'started_by_email', 'ended_by_email', # Capture who started and ended
+    'project_key', 'start_comment', 'end_comment'
+]
+# --- END NEW FIELDNAMES ---
 
 
-# Set initial date to current timestamp (in milliseconds)
-current_scan_timestamp_ms = round(time.time() * 1000)
-total_processed = 0
-current_batch = []
-current_url = url # Use a different variable for the pagination URL
+# --- Initialize CSV files ---
+def initialize_csv(filename, fieldnames):
+    try:
+        with open(filename, 'w', newline='') as csv_file:
+            csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            csv_writer.writeheader()
+        logging.info(f"Initialized CSV file: {filename}")
+    except IOError as e:
+        logging.error(f"Error opening or writing header to CSV file {filename}: {e}")
+        exit(1)
 
-# Fetch audit log entries until reaching the SEARCH_DATE or end of data
-try:
-    with open(output_filename, 'a', newline='') as csv_file:
-        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+initialize_csv(OUTPUT_FLAG_DURATION_CSV, fieldnames_flag_duration)
+initialize_csv(OUTPUT_ROLLOUT_AUTO_CSV, fieldnames_rollout)
+initialize_csv(OUTPUT_ROLLOUT_MANUAL_CSV, fieldnames_rollout)
+# --- END INITIALIZE CSV ---
 
-        while current_scan_timestamp_ms > SEARCH_DATE:
-            params = {
-                'limit': limit,
-                # Use 'before' parameter for pagination based on timestamp
-                'before': current_scan_timestamp_ms
+
+# --- REVISED Fetching Logic: Use POST with payload and _links.next pagination ---
+all_audit_items = [] # List to hold all fetched items
+
+# Start with the base URL for the first request
+current_request_url = url
+
+logging.info("Starting fetch of all relevant audit log entries using POST...")
+logging.info(f"Filtering actions: {ALL_RELEVANT_ACTIONS}")
+fetch_count = 0
+page_count = 0
+
+while current_request_url:
+    page_count += 1
+    logging.info(f"Requesting page {page_count} from URL: {current_request_url}")
+    
+    try:
+        # Add limit parameter only to the first request
+        request_params = {'limit': limit} if page_count == 1 else None
+        # Send payload on ALL requests when paginating a POST filter
+        # request_data = initial_payload if page_count == 1 else None # REVERTED
+        
+        # Make POST request. Use params only for the first request.
+        # Send payload data on all requests for POST pagination.
+        response = requests.post(current_request_url, headers=headers, data=initial_payload, params=request_params)
+
+        response.raise_for_status() # Check for HTTP errors
+
+        data = response.json()
+        items = data.get('items', [])
+        fetch_count += len(items)
+        logging.info(f"Received {len(items)} audit log items this page (Total fetched so far: {fetch_count})")
+
+        if not items and not data.get('_links', {}).get('next'):
+            logging.info("No items on this page and no next link.")
+            break # Exit loop if no items and no next link
+
+        # Add fetched items to the list. Date filtering will happen after all pages are fetched.
+        all_audit_items.extend(items)
+        
+        # --- Check if oldest item on page is before SEARCH_DATE --- 
+        should_stop_fetching = False
+        if items:
+            oldest_item_date = items[-1].get('date')
+            if oldest_item_date and oldest_item_date < SEARCH_DATE:
+                logging.info(f"Oldest item on page {page_count} ({oldest_item_date}) is older than SEARCH_DATE ({SEARCH_DATE}). Stopping pagination.")
+                should_stop_fetching = True
+            elif not oldest_item_date:
+                 logging.warning(f"Could not get date from oldest item on page {page_count}. Stopping pagination as a precaution.")
+                 should_stop_fetching = True # Stop if data seems inconsistent
+        # --- End Date Check ---
+        
+        # Get the URL for the next page from _links
+        next_link = data.get('_links', {}).get('next', {}).get('href')
+        
+        # Decide whether to continue
+        if should_stop_fetching or not next_link:
+            if not next_link and not should_stop_fetching:
+                 logging.info("No next link found. Reached end of audit log results for the query.")
+            current_request_url = None # Stop the loop
+        else:
+            # Prepend base_url if href is relative
+            if next_link.startswith('/'):
+                current_request_url = base_url + next_link
+            else:
+                current_request_url = next_link
+            logging.debug(f"Next page URL: {current_request_url}")
+            
+            # --- REMOVED Old Safety Break Logic ---
+            # --- End REMOVED Old Safety Break ---
+
+    except requests.exceptions.HTTPError as e:
+        logging.error(f"HTTP Error making API request to {response.url}: {e}")
+        # Log specific errors
+        if response.status_code == 401 or response.status_code == 403:
+             logging.error("Received 401/403 Unauthorized/Forbidden. Check API Key permissions.")
+        elif response.status_code == 429:
+             logging.error("Received 429 Too Many Requests. Consider adding a delay (time.sleep).")
+        # Log response text for debugging other errors
+        logging.error(f"Response Text: {response.text[:500]}...")
+        break # Stop on error
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Network or Request Error making API request: {e}")
+        break
+    except json.JSONDecodeError as e:
+        logging.error(f"Error decoding JSON response: {e}. Response text: {response.text[:500]}...")
+        break
+
+logging.info(f"Finished fetching audit log pages. Total items collected before date filtering: {len(all_audit_items)}")
+
+# --- NEW: Filter fetched items by date in memory ---
+original_count = len(all_audit_items)
+all_audit_items = [item for item in all_audit_items if item.get('date', 0) >= SEARCH_DATE]
+filtered_count = len(all_audit_items)
+logging.info(f"Filtered items by date (>= {SEARCH_DATE}). Kept {filtered_count} out of {original_count}.")
+# --- END DATE FILTERING ---
+
+# --- Chronological Processing Logic (remains the same) ---
+# Reverse the list to process oldest first
+all_audit_items.reverse()
+logging.info(f"Reversed item list for chronological processing.")
+
+# Dictionaries to store state during processing
+# Key: (project_key, flag_key)
+flag_on_times = {} # Value: {timestamp: ms, member_email: str, comment: str}
+
+# Key: (project_key, flag_key, rollout_type)
+# rollout_type is 'fallthrough' or 'rule'
+active_rollouts = {} # Value: {timestamp: ms, member_email: str, comment: str}
+
+# Lists to store results before writing to CSV
+flag_duration_results = []
+rollout_auto_results = []
+rollout_manual_results = []
+
+logging.info("Starting chronological processing of audit items...")
+processed_count = 0
+
+for entry in all_audit_items:
+    processed_count += 1
+    if processed_count % 500 == 0: # Log progress periodically
+         logging.info(f"Processing item {processed_count}/{len(all_audit_items)}...")
+
+    details = get_event_details(entry)
+    if not details:
+        continue # Skip entries missing essential info
+        
+    pk = details['project_key']
+    fk = details['flag_key']
+    
+    # Skip if we couldn't identify the flag or project
+    if pk == 'unknown' or fk == 'unknown':
+        logging.debug(f"Skipping entry due to unknown project/flag key at {details['timestamp']}")
+        continue
+        
+    state_key_flag = (pk, fk)
+    state_key_rollout_fallthrough = (pk, fk, 'fallthrough')
+    state_key_rollout_rule = (pk, fk, 'rule')
+
+    event_type = classify_event(details)
+
+    current_time = details['timestamp']
+    current_member = details['member_email']
+    current_comment = details['comment']
+
+    # --- Handle Event Types ---
+    if event_type == 'flag_on':
+        # Record the latest 'on' event details
+        flag_on_times[state_key_flag] = {
+            'timestamp': current_time,
+            'member_email': current_member,
+            'comment': current_comment
+        }
+        logging.debug(f"Flag ON: {state_key_flag} at {current_time}")
+
+    elif event_type == 'flag_off':
+        if state_key_flag in flag_on_times:
+            start_info = flag_on_times[state_key_flag]
+            start_time = start_info['timestamp']
+            duration_seconds = (current_time - start_time) / 1000
+
+            # Format dates
+            start_date_str = datetime.fromtimestamp(start_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            end_date_str = datetime.fromtimestamp(current_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Get end user info from the current event (who turned it off)
+            end_member_info = entry.get('member', {})
+            end_first_name = end_member_info.get('firstName', '')
+            end_last_name = end_member_info.get('lastName', '')
+            end_email = end_member_info.get('email', 'API/System') # Use placeholder if no member
+
+            result = {
+                'flag_key': fk,
+                'flag_name': details['flag_name'],
+                'site_href': details['site_href'],
+                'turn_off_date': end_date_str,
+                'turn_on_date': start_date_str,
+                'duration_seconds': f"{duration_seconds:.2f}" if duration_seconds >= 0 else 'Error (<0s)',
+                'turned_off_by_first_name': end_first_name,
+                'turned_off_by_last_name': end_last_name,
+                'turned_off_by_email': end_email,
+                'project_key': pk,
+                'comment': current_comment # Comment from the 'off' event
             }
+            flag_duration_results.append(result)
+            logging.debug(f"Flag OFF: Matched {state_key_flag}. Duration: {duration_seconds:.2f}s")
+            # Remove the 'on' time state once matched
+            del flag_on_times[state_key_flag]
+        else:
+            # Turned off but no corresponding 'on' found (maybe started before SEARCH_DATE)
+            logging.debug(f"Flag OFF: No matching ON found for {state_key_flag} at {current_time}")
 
-            logging.info(f"Requesting audit logs before {datetime.fromtimestamp(current_scan_timestamp_ms / 1000).strftime('%Y-%m-%d %H:%M:%S')}")
-            try:
-                # Make POST request to LaunchDarkly API using the initial payload
-                response = requests.post(current_url, headers=headers, params=params, data=initial_payload)
-                response.raise_for_status()
+    elif event_type == 'rollout_start_fallthrough':
+        if state_key_rollout_fallthrough in active_rollouts:
+             logging.warning(f"Rollout START (Fallthrough): Already active for {state_key_rollout_fallthrough} at {current_time}. Overwriting previous start.")
+        active_rollouts[state_key_rollout_fallthrough] = {
+            'timestamp': current_time,
+            'member_email': current_member,
+            'comment': current_comment
+        }
+        logging.debug(f"Rollout START (Fallthrough): {state_key_rollout_fallthrough} at {current_time}")
 
-                data = response.json()
-                items = data.get('items', [])
-                logging.info(f"Received {len(items)} audit log items")
+    elif event_type == 'rollout_start_rule':
+        if state_key_rollout_rule in active_rollouts:
+             logging.warning(f"Rollout START (Rule): Already active for {state_key_rollout_rule} at {current_time}. Overwriting previous start.")
+        active_rollouts[state_key_rollout_rule] = {
+            'timestamp': current_time,
+            'member_email': current_member,
+            'comment': current_comment
+        }
+        logging.debug(f"Rollout START (Rule): {state_key_rollout_rule} at {current_time}")
 
-                if not items:
-                    logging.info("No more items found in the specified date range.")
-                    break
+    elif event_type == 'rollout_stop_auto_fallthrough':
+        if state_key_rollout_fallthrough in active_rollouts:
+            start_info = active_rollouts[state_key_rollout_fallthrough]
+            start_time = start_info['timestamp']
+            duration_seconds = (current_time - start_time) / 1000
+            start_date_str = datetime.fromtimestamp(start_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            end_date_str = datetime.fromtimestamp(current_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
 
-                # Filter for 'turned off' events and add to batch
-                turned_off_items = [item for item in items if item.get('titleVerb') == 'turned off the flag']
-                current_batch.extend(turned_off_items)
-                logging.info(f"Added {len(turned_off_items)} 'turned off' items to batch. Batch size: {len(current_batch)}")
+            result = {
+                'flag_key': fk,
+                'flag_name': details['flag_name'],
+                'site_href': details['site_href'],
+                'rollout_type': 'fallthrough',
+                'rollback_type': 'automatic',
+                'start_date': start_date_str,
+                'end_date': end_date_str,
+                'duration_seconds': f"{duration_seconds:.2f}" if duration_seconds >= 0 else 'Error (<0s)',
+                'started_by_email': start_info['member_email'] or 'Unknown/API',
+                'ended_by_email': current_member or 'API/System', # End event member
+                'project_key': pk,
+                'start_comment': start_info['comment'],
+                'end_comment': current_comment
+            }
+            rollout_auto_results.append(result)
+            logging.debug(f"Rollout STOP (Auto Fallthrough): Matched {state_key_rollout_fallthrough}. Duration: {duration_seconds:.2f}s")
+            del active_rollouts[state_key_rollout_fallthrough]
+        else:
+             logging.debug(f"Rollout STOP (Auto Fallthrough): No matching START found for {state_key_rollout_fallthrough} at {current_time}")
+             
+    elif event_type == 'rollout_stop_auto_rule':
+        if state_key_rollout_rule in active_rollouts:
+            start_info = active_rollouts[state_key_rollout_rule]
+            start_time = start_info['timestamp']
+            duration_seconds = (current_time - start_time) / 1000
+            start_date_str = datetime.fromtimestamp(start_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            end_date_str = datetime.fromtimestamp(current_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
 
-                # Process batch if it reaches the specified size
-                if len(current_batch) >= batch_size:
-                    processed = process_batch(current_batch, csv_writer)
-                    total_processed += processed
-                    logging.info(f"Processed and wrote {processed} entries to CSV. Total processed: {total_processed}")
-                    current_batch = [] # Clear the batch
+            result = {
+                'flag_key': fk,
+                'flag_name': details['flag_name'],
+                'site_href': details['site_href'],
+                'rollout_type': 'rule',
+                'rollback_type': 'automatic',
+                'start_date': start_date_str,
+                'end_date': end_date_str,
+                'duration_seconds': f"{duration_seconds:.2f}" if duration_seconds >= 0 else 'Error (<0s)',
+                'started_by_email': start_info['member_email'] or 'Unknown/API',
+                'ended_by_email': current_member or 'API/System', # End event member
+                'project_key': pk,
+                'start_comment': start_info['comment'],
+                'end_comment': current_comment
+            }
+            rollout_auto_results.append(result)
+            logging.debug(f"Rollout STOP (Auto Rule): Matched {state_key_rollout_rule}. Duration: {duration_seconds:.2f}s")
+            del active_rollouts[state_key_rollout_rule]
+        else:
+             logging.debug(f"Rollout STOP (Auto Rule): No matching START found for {state_key_rollout_rule} at {current_time}")
 
-                # Update the timestamp for the next request to the timestamp of the last item received
-                last_item_date = items[-1].get('date')
-                if last_item_date:
-                     # Subtract 1ms to avoid refetching the last item
-                    current_scan_timestamp_ms = last_item_date - 1
-                else:
-                    # Should not happen if items exist, but break defensively
-                    logging.warning("Last item had no date, stopping pagination.")
-                    break
+    elif event_type == 'rollout_stop_manual_fallthrough':
+        if state_key_rollout_fallthrough in active_rollouts:
+            start_info = active_rollouts[state_key_rollout_fallthrough]
+            start_time = start_info['timestamp']
+            duration_seconds = (current_time - start_time) / 1000
+            start_date_str = datetime.fromtimestamp(start_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            end_date_str = datetime.fromtimestamp(current_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
 
-                # Check if the oldest item received is older than our search date
-                if last_item_date <= SEARCH_DATE:
-                    logging.info(f"Oldest item timestamp ({last_item_date}) reached SEARCH_DATE ({SEARCH_DATE}). Stopping.")
-                    break
+            result = {
+                'flag_key': fk,
+                'flag_name': details['flag_name'],
+                'site_href': details['site_href'],
+                'rollout_type': 'fallthrough',
+                'rollback_type': 'manual',
+                'start_date': start_date_str,
+                'end_date': end_date_str,
+                'duration_seconds': f"{duration_seconds:.2f}" if duration_seconds >= 0 else 'Error (<0s)',
+                'started_by_email': start_info['member_email'] or 'Unknown/API',
+                'ended_by_email': current_member or 'API/System', # End event member
+                'project_key': pk,
+                'start_comment': start_info['comment'],
+                'end_comment': current_comment
+            }
+            rollout_manual_results.append(result)
+            logging.debug(f"Rollout STOP (Manual Fallthrough): Matched {state_key_rollout_fallthrough}. Duration: {duration_seconds:.2f}s")
+            del active_rollouts[state_key_rollout_fallthrough]
+        else:
+             logging.debug(f"Rollout STOP (Manual Fallthrough): No matching START found for {state_key_rollout_fallthrough} at {current_time}")
 
-                # Optional: Add a small delay to avoid rate limiting
-                # time.sleep(0.1)
+    elif event_type == 'rollout_stop_manual_rule':
+        if state_key_rollout_rule in active_rollouts:
+            start_info = active_rollouts[state_key_rollout_rule]
+            start_time = start_info['timestamp']
+            duration_seconds = (current_time - start_time) / 1000
+            start_date_str = datetime.fromtimestamp(start_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            end_date_str = datetime.fromtimestamp(current_time / 1000).strftime('%Y-%m-%d %H:%M:%S')
 
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Error making request: {e}")
-                # Optionally implement retries or stop
-                break
-            except json.JSONDecodeError as e:
-                logging.error(f"Error decoding JSON response: {e}. Response text: {response.text}")
-                break # Stop processing if response is invalid
+            result = {
+                'flag_key': fk,
+                'flag_name': details['flag_name'],
+                'site_href': details['site_href'],
+                'rollout_type': 'rule',
+                'rollback_type': 'manual',
+                'start_date': start_date_str,
+                'end_date': end_date_str,
+                'duration_seconds': f"{duration_seconds:.2f}" if duration_seconds >= 0 else 'Error (<0s)',
+                'started_by_email': start_info['member_email'] or 'Unknown/API',
+                'ended_by_email': current_member or 'API/System', # End event member
+                'project_key': pk,
+                'start_comment': start_info['comment'],
+                'end_comment': current_comment
+            }
+            rollout_manual_results.append(result)
+            logging.debug(f"Rollout STOP (Manual Rule): Matched {state_key_rollout_rule}. Duration: {duration_seconds:.2f}s")
+            del active_rollouts[state_key_rollout_rule]
+        else:
+             logging.debug(f"Rollout STOP (Manual Rule): No matching START found for {state_key_rollout_rule} at {current_time}")
 
-        # Process any remaining items in the batch after the loop finishes
-        if current_batch:
-            processed = process_batch(current_batch, csv_writer)
-            total_processed += processed
-            logging.info(f"Processed and wrote final {processed} entries to CSV. Total processed: {total_processed}")
+    # else: event_type == 'other', do nothing
 
-except IOError as e:
-    logging.error(f"Error opening or writing to CSV file {output_filename} during processing: {e}")
+logging.info(f"Finished processing {processed_count} items.")
 
+# --- CSV Writing Logic (remains the same) ---
 
-print(f"Extracted and processed {total_processed} 'flag turned off' events and saved to {output_filename}")
+def write_results_to_csv(filename, fieldnames, results):
+    """Writes the collected results to the specified CSV file."""
+    try:
+        with open(filename, 'a', newline='') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writerows(results)
+        logging.info(f"Successfully wrote {len(results)} records to {filename}")
+    except IOError as e:
+        logging.error(f"Error writing results to CSV file {filename}: {e}")
+    except Exception as e:
+         logging.error(f"Unexpected error writing to {filename}: {e}")
+
+logging.info(f"Writing results to CSV files...")
+write_results_to_csv(OUTPUT_FLAG_DURATION_CSV, fieldnames_flag_duration, flag_duration_results)
+write_results_to_csv(OUTPUT_ROLLOUT_AUTO_CSV, fieldnames_rollout, rollout_auto_results)
+write_results_to_csv(OUTPUT_ROLLOUT_MANUAL_CSV, fieldnames_rollout, rollout_manual_results)
+
+# Final summary message
+print("-"*30)
+print("Processing Summary:")
+print(f"  - Found {len(flag_duration_results)} flag on/off durations.")
+print(f"  - Found {len(rollout_auto_results)} automatically rolled back measured rollouts.")
+print(f"  - Found {len(rollout_manual_results)} manually rolled back measured rollouts.")
+print(f"Results saved to:")
+print(f"  - {OUTPUT_FLAG_DURATION_CSV}")
+print(f"  - {OUTPUT_ROLLOUT_AUTO_CSV}")
+print(f"  - {OUTPUT_ROLLOUT_MANUAL_CSV}")
+print("-"*30)
