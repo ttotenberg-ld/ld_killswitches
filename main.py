@@ -5,7 +5,7 @@ import logging
 from dotenv import load_dotenv
 import csv
 from datetime import datetime, timedelta
-from collections import defaultdict, deque # Added deque for efficient state management if needed later
+from collections import defaultdict, deque
 import time
 import re
 import copy # Needed for deep copying headers for safe logging
@@ -14,11 +14,10 @@ import copy # Needed for deep copying headers for safe logging
 PROJECT = "*"  # The project to search for audit log entries. Use "*" to search all projects
 SEARCH_DATE = 1743551530000  # Earliest date to search for audit log entries, in epoch milliseconds. You can find a converter here: https://www.epochconverter.com/
 
-# --- NEW: Define rollout actions and description substrings (updated) ---
+# Define rollout actions and description substrings
 # Start Actions
 ACTION_START_ROLLOUT_FALLTHROUGH = "updateFallthroughWithMeasuredRollout"
 ACTION_START_ROLLOUT_RULE = "updateRulesWithMeasuredRollout"
-# Use substrings now, not prefixes
 SUBSTR_START_ROLLOUT_FALLTHROUGH = "Set a guarded rollout on the default rule"
 # For rules, check for either of these substrings based on samples
 SUBSTR_START_ROLLOUT_RULE_1 = "Updated a rule with a guarded rollout"
@@ -35,19 +34,16 @@ ACTION_MANUAL_STOP_FALLTHROUGH = "stopMeasuredRolloutOnFlagFallthrough"
 ACTION_MANUAL_STOP_RULE = "stopMeasuredRolloutOnFlagRule"
 SUBSTR_MANUAL_STOP_FALLTHROUGH = "Guarded rollout on the default rule was manually reverted"
 # No reliable description substring for manual rule stop based on samples - rely on action only
-# DESC_PREFIX_MANUAL_STOP_RULE = # REMOVED
-# --- END NEW DEFINITIONS ---
 
-# --- NEW: Define output filenames ---
+# Define output filenames
 OUTPUT_FLAG_DURATION_CSV = 'flag_on_durations.csv'
 OUTPUT_ROLLOUT_AUTO_CSV = 'measured_rollout_automatic_rollback.csv'
 OUTPUT_ROLLOUT_MANUAL_CSV = 'measured_rollout_manual_rollback.csv'
-# --- END NEW FILENAMES ---
 
-# Set up logging for better debugging and monitoring
+# Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load environment variables from .env file for secure configuration
+# Load environment variables
 load_dotenv()
 logging.info("Environment variables loaded")
 
@@ -56,7 +52,7 @@ base_url = "https://app.launchdarkly.com"
 api_url_auditlog = "/api/v2/auditlog"
 url = base_url + api_url_auditlog
 
-# Retrieve API key from environment variable for security
+# Retrieve API key
 api_key = os.getenv('LAUNCHDARKLY_API_KEY')
 if not api_key:
     logging.error("LAUNCHDARKLY_API_KEY not found in environment variables")
@@ -66,10 +62,10 @@ logging.info("API key retrieved from environment variables")
 # Set up headers for API requests
 headers = {
   'Authorization': f'{api_key}',
-  'Content-Type': 'application/json' # Needed again for POST
+  'Content-Type': 'application/json'
 }
 
-# --- Define ALL_RELEVANT_ACTIONS first ---
+# Define actions to filter in the API request
 ALL_RELEVANT_ACTIONS = [
     "updateOn", # For flag on/off
     ACTION_START_ROLLOUT_FALLTHROUGH,
@@ -80,7 +76,7 @@ ALL_RELEVANT_ACTIONS = [
     ACTION_MANUAL_STOP_RULE
 ]
 
-# --- REINSTATED: initial_payload for POST ---
+# Define the initial payload for the POST request
 initial_payload = json.dumps([
   {
     "resources": [
@@ -90,12 +86,11 @@ initial_payload = json.dumps([
     "actions": ALL_RELEVANT_ACTIONS # Fetch all action types we might need
   }
 ])
-# --- END REINSTATED PAYLOAD ---
 
 # API and processing configuration
 limit = 20  # Number of items per page
 
-# --- Define Helper Functions Before Processing Loop ---
+# --- Helper Functions ---
 def extract_project_key(site_href):
     """
     Extract the project key from the site href, trying various known patterns.
@@ -110,15 +105,14 @@ def extract_project_key(site_href):
         return ''
         
     # Define patterns, from more specific/common to less specific
-    # Order matters!
     patterns = [
-        # Pattern 1: Matches site hrefs like /proj-key/production/features/flag-key
+        # Matches site hrefs like /proj-key/production/features/flag-key
         r'^/([^/]+)/[^/]+/features/', 
-        # Pattern 2: Matches site hrefs like /projects/proj-key/flags/flag-key
+        # Matches site hrefs like /projects/proj-key/flags/flag-key
         r'/projects/([^/]+)/flags/',  
-         # Pattern 3: Matches parent hrefs like /api/v2/flags/proj-key/flag-key
+         # Matches parent hrefs like /api/v2/flags/proj-key/flag-key
         r'/flags/([^/]+)/',          
-        # Pattern 4: Fallback for general /projects/proj-key/... links
+        # Fallback for general /projects/proj-key/... links
         r'/projects/([^/]+)/'       
     ]
 
@@ -132,7 +126,6 @@ def extract_project_key(site_href):
                 return extracted_key
             else:
                 logging.debug(f"Pattern '{pattern}' matched non-project key '{extracted_key}' in href: {site_href}. Trying next pattern.")
-        # else: Keep trying other patterns
 
     logging.warning(f"Could not extract project key using any known pattern from href: {site_href}")
     return ''
@@ -155,7 +148,6 @@ def extract_flag_key_from_href(href):
     if match:
         return match.group(1)
     else:
-        # Changed to debug level to reduce noise for expected non-matching parent_href like /api/v2/auditlog
         logging.debug(f"Could not extract flag key from href (expected '/flags/project/key...'): {href}") 
         return ''
 
@@ -172,7 +164,6 @@ def extract_flag_key_from_site_href(site_href):
     """
     if not site_href:
         return ''
-    # Updated regex to match the segment after /features/
     match = re.search(r'/features/([^/?]+)', site_href)
     if match:
         flag_key = match.group(1)
@@ -195,7 +186,7 @@ def get_event_details(entry):
         'flag_key': 'unknown',
         'site_href_raw': entry.get('_links', {}).get('site', {}).get('href', ''),
         'parent_href': entry.get('_links', {}).get('parent', {}).get('href', ''),
-        'titleVerb': entry.get('titleVerb', '') # Added titleVerb
+        'titleVerb': entry.get('titleVerb', '')
     }
 
     # Extract action from the accesses array
@@ -203,7 +194,7 @@ def get_event_details(entry):
     if accesses and isinstance(accesses, list) and len(accesses) > 0:
         details['action'] = accesses[0].get('action')
 
-    # Extract flag key (reusing existing logic - usually works on parent_href or site_href)
+    # Extract flag key (usually works on parent_href or site_href)
     flag_key = extract_flag_key_from_href(details['parent_href'])
     if not flag_key:
         flag_key = extract_flag_key_from_site_href(details['site_href_raw'])
@@ -212,7 +203,7 @@ def get_event_details(entry):
     else:
         logging.debug(f"Could not determine flag key for entry at {details['timestamp']}")
 
-    # --- MODIFIED: Project Key Extraction Logic --- 
+    # Extract Project Key
     project_key = ''
     parent_href = details['parent_href']
     site_href_raw = details['site_href_raw']
@@ -235,12 +226,9 @@ def get_event_details(entry):
         if project_key:
              logging.debug(f"Successfully extracted project key '{project_key}' from site_href_raw.")
         else:
-            # Final failure point for project key
             logging.debug(f"Could not determine project key from site_href_raw either for entry at {details['timestamp']}")
-            # Keep project_key as '' which will become 'unknown'
             
     details['project_key'] = project_key if project_key else 'unknown'
-    # --- END MODIFIED Project Key Extraction --- 
 
     # Construct a more useful site href if possible
     if details['project_key'] != 'unknown' and details['flag_key'] != 'unknown':
@@ -259,12 +247,11 @@ def check_description_contains(description, substring):
     """Checks if the description contains the given substring, ignoring case and leading/trailing whitespace."""
     if not description or not substring:
         return False
-    # Normalize both to lower case for robust matching
     return substring.lower() in description.lower()
 
 def classify_event(details):
     """Classifies the event based on action and description content."""
-    action = details['action'] # Action might be None if accesses array is missing/empty
+    action = details['action'] 
     desc = details['description']
 
     # Flag On/Off (using titleVerb is primary identifier)
@@ -280,7 +267,6 @@ def classify_event(details):
     # Rollout Start
     if action == ACTION_START_ROLLOUT_FALLTHROUGH and check_description_contains(desc, SUBSTR_START_ROLLOUT_FALLTHROUGH):
         return 'rollout_start_fallthrough'
-    # Check for either rule start substring
     if action == ACTION_START_ROLLOUT_RULE and (check_description_contains(desc, SUBSTR_START_ROLLOUT_RULE_1) or check_description_contains(desc, SUBSTR_START_ROLLOUT_RULE_2)):
         return 'rollout_start_rule'
 
@@ -293,14 +279,12 @@ def classify_event(details):
     # Manual Rollback
     if action == ACTION_MANUAL_STOP_FALLTHROUGH and check_description_contains(desc, SUBSTR_MANUAL_STOP_FALLTHROUGH):
         return 'rollout_stop_manual_fallthrough'
-    # For manual rule stop, rely only on the action as description is unreliable
-    if action == ACTION_MANUAL_STOP_RULE:
+    if action == ACTION_MANUAL_STOP_RULE: # Relies only on action for manual rule stop
         return 'rollout_stop_manual_rule'
 
     return 'other' # Not an event we are tracking
-# --- End Helper Function Definitions ---
 
-# --- Define NEW CSV fieldnames for the three files ---
+# --- Define CSV fieldnames ---
 fieldnames_flag_duration = [
     'flag_key', 'flag_name', 'site_href', 'turn_off_date', 'turn_on_date', 'duration_seconds',
     'turned_off_by_first_name', 'turned_off_by_last_name', 'turned_off_by_email',
@@ -314,11 +298,10 @@ fieldnames_rollout = [
     'started_by_email', 'ended_by_email', # Capture who started and ended
     'project_key', 'start_comment', 'end_comment'
 ]
-# --- END NEW FIELDNAMES ---
-
 
 # --- Initialize CSV files ---
 def initialize_csv(filename, fieldnames):
+    """Creates a CSV file and writes the header row."""
     try:
         with open(filename, 'w', newline='') as csv_file:
             csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -331,10 +314,8 @@ def initialize_csv(filename, fieldnames):
 initialize_csv(OUTPUT_FLAG_DURATION_CSV, fieldnames_flag_duration)
 initialize_csv(OUTPUT_ROLLOUT_AUTO_CSV, fieldnames_rollout)
 initialize_csv(OUTPUT_ROLLOUT_MANUAL_CSV, fieldnames_rollout)
-# --- END INITIALIZE CSV ---
 
-
-# --- REVISED Fetching Logic: Use POST with payload and _links.next pagination ---
+# --- Fetch Audit Log Data ---
 all_audit_items = [] # List to hold all fetched items
 
 # Start with the base URL for the first request
@@ -345,6 +326,7 @@ logging.info(f"Filtering actions: {ALL_RELEVANT_ACTIONS}")
 fetch_count = 0
 page_count = 0
 
+# Fetch pages until the 'next' link is null or we encounter entries older than SEARCH_DATE
 while current_request_url:
     page_count += 1
     logging.info(f"Requesting page {page_count} from URL: {current_request_url}")
@@ -352,8 +334,6 @@ while current_request_url:
     try:
         # Add limit parameter only to the first request
         request_params = {'limit': limit} if page_count == 1 else None
-        # Send payload on ALL requests when paginating a POST filter
-        # request_data = initial_payload if page_count == 1 else None # REVERTED
         
         # Make POST request. Use params only for the first request.
         # Send payload data on all requests for POST pagination.
@@ -370,10 +350,9 @@ while current_request_url:
             logging.info("No items on this page and no next link.")
             break # Exit loop if no items and no next link
 
-        # Add fetched items to the list. Date filtering will happen after all pages are fetched.
         all_audit_items.extend(items)
         
-        # --- Check if oldest item on page is before SEARCH_DATE --- 
+        # Stop fetching if the oldest item on the page is older than our search date
         should_stop_fetching = False
         if items:
             oldest_item_date = items[-1].get('date')
@@ -383,7 +362,6 @@ while current_request_url:
             elif not oldest_item_date:
                  logging.warning(f"Could not get date from oldest item on page {page_count}. Stopping pagination as a precaution.")
                  should_stop_fetching = True # Stop if data seems inconsistent
-        # --- End Date Check ---
         
         # Get the URL for the next page from _links
         next_link = data.get('_links', {}).get('next', {}).get('href')
@@ -401,9 +379,6 @@ while current_request_url:
                 current_request_url = next_link
             logging.debug(f"Next page URL: {current_request_url}")
             
-            # --- REMOVED Old Safety Break Logic ---
-            # --- End REMOVED Old Safety Break ---
-
     except requests.exceptions.HTTPError as e:
         logging.error(f"HTTP Error making API request to {response.url}: {e}")
         # Log specific errors
@@ -423,14 +398,13 @@ while current_request_url:
 
 logging.info(f"Finished fetching audit log pages. Total items collected before date filtering: {len(all_audit_items)}")
 
-# --- NEW: Filter fetched items by date in memory ---
+# Filter fetched items by date in memory
 original_count = len(all_audit_items)
 all_audit_items = [item for item in all_audit_items if item.get('date', 0) >= SEARCH_DATE]
 filtered_count = len(all_audit_items)
 logging.info(f"Filtered items by date (>= {SEARCH_DATE}). Kept {filtered_count} out of {original_count}.")
-# --- END DATE FILTERING ---
 
-# --- Chronological Processing Logic (remains the same) ---
+# --- Process Audit Log Data ---
 # Reverse the list to process oldest first
 all_audit_items.reverse()
 logging.info(f"Reversed item list for chronological processing.")
@@ -440,7 +414,6 @@ logging.info(f"Reversed item list for chronological processing.")
 flag_on_times = {} # Value: {timestamp: ms, member_email: str, comment: str}
 
 # Key: (project_key, flag_key, rollout_type)
-# rollout_type is 'fallthrough' or 'rule'
 active_rollouts = {} # Value: {timestamp: ms, member_email: str, comment: str}
 
 # Lists to store results before writing to CSV
@@ -453,7 +426,7 @@ processed_count = 0
 
 for entry in all_audit_items:
     processed_count += 1
-    if processed_count % 500 == 0: # Log progress periodically
+    if processed_count % 500 == 0:
          logging.info(f"Processing item {processed_count}/{len(all_audit_items)}...")
 
     details = get_event_details(entry)
@@ -478,9 +451,7 @@ for entry in all_audit_items:
     current_member = details['member_email']
     current_comment = details['comment']
 
-    # --- Handle Event Types ---
     if event_type == 'flag_on':
-        # Record the latest 'on' event details
         flag_on_times[state_key_flag] = {
             'timestamp': current_time,
             'member_email': current_member,
@@ -522,7 +493,6 @@ for entry in all_audit_items:
             # Remove the 'on' time state once matched
             del flag_on_times[state_key_flag]
         else:
-            # Turned off but no corresponding 'on' found (maybe started before SEARCH_DATE)
             logging.debug(f"Flag OFF: No matching ON found for {state_key_flag} at {current_time}")
 
     elif event_type == 'rollout_start_fallthrough':
@@ -661,16 +631,15 @@ for entry in all_audit_items:
         else:
              logging.debug(f"Rollout STOP (Manual Rule): No matching START found for {state_key_rollout_rule} at {current_time}")
 
-    # else: event_type == 'other', do nothing
-
 logging.info(f"Finished processing {processed_count} items.")
 
-# --- CSV Writing Logic (remains the same) ---
+# --- Write Results to CSV ---
 
 def write_results_to_csv(filename, fieldnames, results):
     """Writes the collected results to the specified CSV file."""
     try:
-        with open(filename, 'a', newline='') as csv_file:
+        # Use 'a' append mode as the header is written during initialization
+        with open(filename, 'a', newline='') as csv_file: 
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writerows(results)
         logging.info(f"Successfully wrote {len(results)} records to {filename}")
